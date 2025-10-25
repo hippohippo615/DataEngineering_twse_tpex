@@ -1,0 +1,198 @@
+version: "3.8"
+
+# 共用環境變數（你的爬蟲資料庫：financialdata）
+x-common-env: &common_env
+  TZ: Asia/Taipei
+  MYSQL_DATA_HOST: mysql
+  MYSQL_DATA_PORT: "3306"
+  MYSQL_DATA_DATABASE: financialdata
+  MYSQL_DATA_USER: user
+  MYSQL_DATA_PASSWORD: test
+
+# Airflow metadata DB 與 Celery 設定（同一網路需有名為 mysql 的 MySQL 服務）
+#x-airflow-meta: &airflow_meta
+ # AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: mysql+pymysql://airflow:airflow@mysql:3306/airflow
+  #AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
+  #AIRFLOW__CELERY__RESULT_BACKEND: db+mysql+pymysql://airflow:airflow@mysql:3306/airflow
+x-airflow-meta: &airflow_meta
+  # Airflow 2.2.x 常用的舊鍵（保險起見一併設定）
+  AIRFLOW__CORE__SQL_ALCHEMY_CONN:     mysql+pymysql://root:test@mysql:3306/airflow
+  # Airflow 2.3+ 的新鍵
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: mysql+pymysql://root:test@mysql:3306/airflow
+
+  AIRFLOW__CELERY__BROKER_URL:         redis://redis:6379/0
+  AIRFLOW__CELERY__RESULT_BACKEND:     db+mysql+pymysql://root:test@mysql:3306/airflow  
+
+services:
+  initdb:
+    image: hippohippo615/dataflow:12.8
+    command: pipenv run airflow db init
+    environment:
+      <<: [*common_env, *airflow_meta]
+    restart: on-failure
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints: ["node.labels.airflow == true"]
+      resources:
+        limits:
+          memory: 256M
+    networks: [my_network]
+
+  create-user:
+    image: hippohippo615/dataflow:12.8
+    command: >
+      pipenv run airflow users create
+      --username admin --firstname lin --lastname sam
+      --role Admin -p admin --email finmind.tw@gmail.com
+    depends_on: [initdb]
+    environment:
+      <<: [*common_env, *airflow_meta]
+    restart: on-failure
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints: ["node.labels.airflow == true"]
+      resources:
+        limits:
+          memory: 128M
+    networks: [my_network]
+
+  redis:
+    image: redis:5.0
+    ports: ["6379:6379"]
+    volumes: ["redis_data:/data"]
+    environment:
+      ALLOW_EMPTY_PASSWORD: "yes"
+    restart: always
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints: ["node.labels.airflow == true"]
+      resources:
+        limits:
+          memory: 128M
+    networks: [my_network]
+
+  webserver:
+    image: hippohippo615/dataflow:12.8
+    hostname: "airflow-webserver"
+    command: pipenv run airflow webserver -p 8888
+    depends_on: [initdb]
+    ports: ["8888:8888"]
+    environment:
+      <<: [*common_env, *airflow_meta]
+      AIRFLOW__WEBSERVER__WORKERS: "1"
+    restart: always
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints: ["node.labels.airflow == true"]
+      resources:
+        limits:
+          memory: 350M
+    networks: [my_network]
+
+  flower:
+    image: mher/flower:0.9.5
+    command: ["flower", "--address=0.0.0.0", "--broker=redis://redis:6379/0", "--port=5555"]
+    depends_on: [redis]
+    ports: ["5555:5555"]
+    restart: always
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints: ["node.labels.airflow == true"]
+      resources:
+        limits:
+          memory: 128M
+    networks: [my_network]
+
+  scheduler:
+    image: hippohippo615/dataflow:12.8
+    hostname: "airflow-scheduler"
+    command: pipenv run airflow scheduler
+    depends_on: [initdb]
+    environment:
+      <<: [*common_env, *airflow_meta]
+      AIRFLOW__SCHEDULER__MAX_THREADS: "1"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: always
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints: ["node.labels.airflow == true"]
+      resources:
+        limits:
+          memory: 250M
+    networks: [my_network]
+
+  worker:
+    image: hippohippo615/dataflow:12.8
+    hostname: "{{.Service.Name}}.{{.Task.Slot}}"
+    command: pipenv run airflow celery worker --concurrency 1 
+    depends_on: [scheduler]
+    environment:
+      <<: [*common_env, *airflow_meta]
+    restart: always
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints: ["node.labels.worker == true"]
+      resources:
+        limits:
+          memory: 1024M
+    networks: [my_network]
+
+  crawler_twse:
+    image: hippohippo615/dataflow:12.8
+    hostname: "{{.Service.Name}}.{{.Task.Slot}}"
+    command: pipenv run airflow celery worker -q twse --concurrency 1 
+    depends_on: [scheduler]
+    environment:
+      <<: [*common_env, *airflow_meta]
+    restart: always
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        max_replicas_per_node: 1
+        constraints: ["node.labels.crawler_twse == true"]
+      resources:
+        limits:
+          memory: 1024M
+    networks: [my_network]
+
+  crawler_tpex:
+    image: hippohippo615/dataflow:12.8
+    hostname: "{{.Service.Name}}.{{.Task.Slot}}"
+    command: pipenv run airflow celery worker -q tpex --concurrency 1 
+    depends_on: [scheduler]
+    environment:
+      <<: [*common_env, *airflow_meta]
+    restart: always
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        max_replicas_per_node: 1
+        constraints: ["node.labels.crawler_tpex == true"]
+      resources:
+        limits:
+          memory: 1024M
+    networks: [my_network]
+
+networks:
+  my_network:
+    external: true  # 需先以 overlay 建好：docker network create --driver overlay my_network
+
+volumes:
+  redis_data:
